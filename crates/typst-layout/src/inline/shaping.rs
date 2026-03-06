@@ -14,8 +14,9 @@ use typst_library::foundations::{Regex, Smart, StyleChain};
 use typst_library::layout::{Abs, Dir, Em, Frame, FrameItem, Point, Rel, Size};
 use typst_library::model::{JustificationLimits, ParElem};
 use typst_library::text::{
-    Font, FontFamily, FontVariant, Glyph, Lang, Region, ShiftSettings, TextEdgeBounds,
-    TextElem, TextItem, families, features, is_default_ignorable, language, variant,
+    Font, FontFamily, FontFlags, FontVariant, FontVariations, Glyph, Lang, Region,
+    ShiftSettings, TextEdgeBounds, TextElem, TextItem, families, features,
+    is_default_ignorable, language, variant, variations,
 };
 use typst_utils::SliceExt;
 use unicode_bidi::{BidiInfo, Level as BidiLevel};
@@ -798,6 +799,7 @@ fn shape<'a>(
         styles,
         variant: variant(styles),
         features: features(styles),
+        variations: FontVariations(variations(styles)),
         fallback: styles.get(TextElem::fallback),
         dir,
         shift_settings,
@@ -836,6 +838,7 @@ struct ShapingContext<'a> {
     size: Abs,
     variant: FontVariant,
     features: Vec<rustybuzz::Feature>,
+    variations: FontVariations,
     fallback: bool,
     dir: Dir,
     shift_settings: Option<ShiftSettings>,
@@ -951,6 +954,15 @@ fn shape_segment<'a>(
         })
     else {
         return;
+    };
+
+    // Apply variation coordinates if the font is variable.
+    let font = if !ctx.variations.0.is_empty()
+        && font.info().flags.contains(FontFlags::VARIABLE)
+    {
+        apply_variations(&font, &ctx.variations).unwrap_or(font)
+    } else {
+        font
     };
 
     // Fill the buffer with our text.
@@ -1191,6 +1203,15 @@ fn determine_shift(
                 None,
             )
         })
+}
+
+/// Create a font instance with the given variation coordinates applied.
+///
+/// This is memoized so that repeated shaping calls with the same base font and
+/// variation coordinates reuse the same `Font` object.
+#[comemo::memoize]
+fn apply_variations(font: &Font, variations: &FontVariations) -> Option<Font> {
+    Font::new_with_variations(font.data().clone(), font.index(), &variations.0)
 }
 
 /// Create a shape plan.

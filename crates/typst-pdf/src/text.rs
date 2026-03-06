@@ -84,7 +84,24 @@ fn build_font(typst_font: Font) -> SourceResult<krilla::text::Font> {
     let font_data: Arc<dyn AsRef<[u8]> + Send + Sync> =
         Arc::new(typst_font.data().clone());
 
-    match krilla::text::Font::new(font_data.into(), typst_font.index()) {
+    let variations = typst_font.variations();
+    let krilla_font = if variations.is_empty() {
+        krilla::text::Font::new(font_data.into(), typst_font.index())
+    } else {
+        let coords: Vec<(krilla::text::Tag, f32)> = variations
+            .iter()
+            .map(|&(tag, value)| {
+                (krilla::text::Tag::new(&tag.to_bytes()), value)
+            })
+            .collect();
+        krilla::text::Font::new_variable(
+            font_data.into(),
+            typst_font.index(),
+            &coords,
+        )
+    };
+
+    match krilla_font {
         Some(f) => Ok(f),
         None => {
             bail!(

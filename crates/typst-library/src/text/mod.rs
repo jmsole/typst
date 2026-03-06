@@ -215,6 +215,11 @@ pub struct TextElem {
     /// desired weight is not available, Typst selects the font from the family
     /// that is closest in weight.
     ///
+    /// When using a variable font, the weight value is additionally used to
+    /// set the `wght` variation axis, enabling smooth interpolation between
+    /// weights. This can be overridden with an explicit
+    /// [`variations`]($text.variations) entry.
+    ///
     /// If you want to strongly emphasize your text, you should do so using the
     /// [strong] function instead. This makes it easy to adapt the style later
     /// if you change your mind about how to signify the strong emphasis.
@@ -235,6 +240,11 @@ pub struct TextElem {
     /// `{200%}`. When the desired width is not available, Typst selects the
     /// font from the family that is closest in stretch. This will only stretch
     /// the text if a condensed or expanded version of the font is available.
+    ///
+    /// When using a variable font with a `wdth` axis, the stretch value is
+    /// additionally used to set that axis, enabling smooth interpolation.
+    /// This can be overridden with an explicit
+    /// [`variations`]($text.variations) entry.
     ///
     /// If you want to adjust the amount of space between characters instead of
     /// stretching the glyphs itself, use the [`tracking`]($text.tracking)
@@ -744,6 +754,48 @@ pub struct TextElem {
     #[fold]
     #[ghost]
     pub features: FontFeatures,
+
+    /// OpenType font variation axis coordinates to apply. This is used to
+    /// select specific instances of
+    /// [variable fonts](https://fonts.google.com/knowledge/glossary/variable_fonts)
+    /// by setting axis values directly.
+    ///
+    /// When a variable font is available, the `variations` property lets you
+    /// interpolate along its design axes. Standard axes include:
+    ///
+    /// - `wght`: Weight (typically 100 to 900)
+    /// - `wdth`: Width (percentage, e.g. 75 for condensed, 100 for normal)
+    /// - `opsz`: Optical size
+    /// - `ital`: Italic (0 or 1)
+    /// - `slnt`: Slant (degrees)
+    ///
+    /// Custom axes defined by the font designer are also supported.
+    ///
+    /// The [`weight`]($text.weight) and [`stretch`]($text.stretch) properties
+    /// automatically map to the `wght` and `wdth` axes respectively. When both
+    /// `variations` and `weight` / `stretch` are set, explicit `variations`
+    /// entries take precedence for rendering, while `weight` / `stretch` are
+    /// still used for font selection.
+    ///
+    /// Accepts a dictionary mapping four-character axis tags to floating-point
+    /// values.
+    ///
+    /// ```typ
+    /// // Set weight to 350 and width to 75% on a variable font.
+    /// #set text(variations: (wght: 350, wdth: 75))
+    ///
+    /// // Set only the optical size axis.
+    /// #set text(variations: (opsz: 24))
+    ///
+    /// // Weight property maps to wght automatically;
+    /// // explicit variations entry overrides it.
+    /// #set text(weight: 700, variations: (wght: 400))
+    /// // The text renders at wght=400 (variations wins),
+    /// // but font selection still uses weight 700.
+    /// ```
+    #[fold]
+    #[ghost]
+    pub variations: FontVariations,
 
     /// Content in which all text is styled according to the other arguments.
     #[external]
@@ -1328,6 +1380,58 @@ impl Fold for FontFeatures {
     }
 }
 
+/// OpenType font variation axis settings.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct FontVariations(pub Vec<(Tag, f32)>);
+
+impl Eq for FontVariations {}
+
+impl Hash for FontVariations {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for &(tag, value) in &self.0 {
+            tag.hash(state);
+            value.to_bits().hash(state);
+        }
+    }
+}
+
+cast! {
+    FontVariations,
+    self => self.0
+        .into_iter()
+        .map(|(tag, num)| {
+            let bytes = tag.to_bytes();
+            let key = std::str::from_utf8(&bytes).unwrap_or_default();
+            (key.into(), (num as f64).into_value())
+        })
+        .collect::<Dict>()
+        .into_value(),
+    values: Dict => Self(values
+        .into_iter()
+        .enumerate()
+        .map(|(i, (k, v))| Ok((
+            k.clone().into_value().cast::<Tag>().hint(tag_hint_helper(i, &k))?,
+            v.cast::<f64>().hint(tag_hint_helper(i, &k))? as f32,
+        )))
+        .collect::<HintedStrResult<_>>()?),
+}
+
+impl Fold for FontVariations {
+    fn fold(self, outer: Self) -> Self {
+        // Later (inner) values override earlier (outer) values for the same tag.
+        let mut merged = outer.0;
+        for (tag, value) in self.0 {
+            if let Some(entry) = merged.iter_mut().find(|(t, _)| *t == tag) {
+                entry.1 = value;
+            } else {
+                merged.push((tag, value));
+            }
+        }
+        Self(merged)
+    }
+}
+
 /// Collect the OpenType features to apply.
 pub fn features(styles: StyleChain) -> Vec<Feature> {
     let mut tags = vec![];
@@ -1402,6 +1506,33 @@ pub fn features(styles: StyleChain) -> Vec<Feature> {
     }
 
     tags
+}
+
+/// Collect the font variation axis coordinates to apply.
+///
+/// Merges explicit `variations` with `weight` and `stretch` mapped to
+/// their corresponding OpenType axes (`wght`, `wdth`). Explicit
+/// `variations` entries take precedence (CSS-style override).
+pub fn variations(styles: StyleChain) -> Vec<(Tag, f32)> {
+    let mut coords: Vec<(Tag, f32)> = Vec::new();
+
+    // Map weight and stretch to their axis equivalents.
+    let weight = styles.get(TextElem::weight);
+    coords.push((Tag::from_bytes(b"wght"), weight.to_number() as f32));
+
+    let stretch = styles.get(TextElem::stretch);
+    coords.push((Tag::from_bytes(b"wdth"), stretch.to_ratio().get() as f32 * 100.0));
+
+    // Explicit variations override the above.
+    for (tag, value) in styles.get_cloned(TextElem::variations).0 {
+        if let Some(entry) = coords.iter_mut().find(|(t, _)| *t == tag) {
+            entry.1 = value;
+        } else {
+            coords.push((tag, value));
+        }
+    }
+
+    coords
 }
 
 /// Process the language and region of a style chain into a
@@ -1519,26 +1650,12 @@ pub fn is_default_ignorable(c: char) -> bool {
 fn check_font_list(engine: &mut Engine, list: &Spanned<FontList>) {
     let book = engine.world.book();
     for family in &list.v {
-        match book.select_family(family.as_str()).next() {
-            Some(index) => {
-                if book
-                    .info(index)
-                    .is_some_and(|x| x.flags.contains(FontFlags::VARIABLE))
-                {
-                    engine.sink.warn(warning!(
-                        list.span,
-                        "variable fonts are not currently supported and may render \
-                         incorrectly";
-                        hint: "try installing a static version of \"{}\" instead",
-                            family.as_str();
-                    ))
-                }
-            }
-            None => engine.sink.warn(warning!(
+        if book.select_family(family.as_str()).next().is_none() {
+            engine.sink.warn(warning!(
                 list.span,
                 "unknown font family: {}",
                 family.as_str(),
-            )),
+            ))
         }
     }
 }

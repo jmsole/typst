@@ -14,7 +14,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
-use ttf_parser::{GlyphId, name_id};
+use ttf_parser::{GlyphId, Tag, name_id};
 
 use self::book::find_name;
 use crate::foundations::{Bytes, Cast};
@@ -33,6 +33,9 @@ pub struct Font(Arc<FontInner>);
 struct FontInner {
     /// The font's index in the buffer.
     index: u32,
+    /// Variation axis coordinates applied to this font instance.
+    /// Sorted by tag for deterministic hashing. Empty for static fonts.
+    variations: Vec<(Tag, f32)>,
     /// Metadata about the font.
     info: FontInfo,
     /// The font's metrics.
@@ -54,6 +57,18 @@ struct FontInner {
 impl Font {
     /// Parse a font from data and collection index.
     pub fn new(data: Bytes, index: u32) -> Option<Self> {
+        Self::new_with_variations(data, index, &[])
+    }
+
+    /// Parse a font from data and collection index, applying the given
+    /// variation axis coordinates. The variations are applied to both the
+    /// ttf-parser and rustybuzz faces so that metrics, outlines, and shaping
+    /// all reflect the chosen instance.
+    pub fn new_with_variations(
+        data: Bytes,
+        index: u32,
+        variations: &[(Tag, f32)],
+    ) -> Option<Self> {
         // Safety:
         // - The slices's location is stable in memory:
         //   - We don't move the underlying vector
@@ -63,12 +78,32 @@ impl Font {
         let slice: &'static [u8] =
             unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
 
-        let ttf = ttf_parser::Face::parse(slice, index).ok()?;
-        let rusty = rustybuzz::Face::from_slice(slice, index)?;
+        let mut ttf = ttf_parser::Face::parse(slice, index).ok()?;
+        let mut rusty = rustybuzz::Face::from_slice(slice, index)?;
+
+        // Apply variation coordinates to both faces.
+        for &(tag, value) in variations {
+            ttf.set_variation(tag, value);
+            rusty.set_variation(tag, value);
+        }
+
+        // Compute metrics *after* variations so they reflect the instance.
         let metrics = FontMetrics::from_ttf(&ttf);
         let info = FontInfo::from_ttf(&ttf)?;
 
-        Some(Self(Arc::new(FontInner { data, index, info, metrics, ttf, rusty })))
+        // Store a sorted copy for deterministic hashing.
+        let mut sorted_variations: Vec<(Tag, f32)> = variations.to_vec();
+        sorted_variations.sort_by_key(|(tag, _)| *tag);
+
+        Some(Self(Arc::new(FontInner {
+            data,
+            index,
+            variations: sorted_variations,
+            info,
+            metrics,
+            ttf,
+            rusty,
+        })))
     }
 
     /// Parse all fonts in the given data.
@@ -148,6 +183,12 @@ impl Font {
         &self.0.rusty
     }
 
+    /// The variation axis coordinates applied to this font instance.
+    /// Empty for static fonts or variable fonts at their default instance.
+    pub fn variations(&self) -> &[(Tag, f32)] {
+        &self.0.variations
+    }
+
     /// Resolve the top and bottom edges of text.
     pub fn edges(
         &self,
@@ -195,6 +236,11 @@ impl Hash for Font {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.data.hash(state);
         self.0.index.hash(state);
+        // Hash variations as raw bits for deterministic f32 hashing.
+        for (tag, value) in &self.0.variations {
+            tag.hash(state);
+            value.to_bits().hash(state);
+        }
     }
 }
 
@@ -208,7 +254,17 @@ impl Eq for Font {}
 
 impl PartialEq for Font {
     fn eq(&self, other: &Self) -> bool {
-        self.0.data == other.0.data && self.0.index == other.0.index
+        self.0.data == other.0.data
+            && self.0.index == other.0.index
+            && self.0.variations.len() == other.0.variations.len()
+            && self
+                .0
+                .variations
+                .iter()
+                .zip(&other.0.variations)
+                .all(|((t1, v1), (t2, v2))| {
+                    t1 == t2 && v1.to_bits() == v2.to_bits()
+                })
     }
 }
 
